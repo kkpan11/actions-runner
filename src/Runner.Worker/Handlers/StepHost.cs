@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-using GitHub.DistributedTask.Pipelines.ContextData;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -9,7 +8,6 @@ using GitHub.Runner.Common;
 using GitHub.Runner.Sdk;
 using System.Linq;
 using GitHub.Runner.Worker.Container.ContainerHooks;
-using System.IO;
 using System.Threading.Channels;
 
 namespace GitHub.Runner.Worker.Handlers
@@ -60,7 +58,24 @@ namespace GitHub.Runner.Worker.Handlers
 
         public Task<string> DetermineNodeRuntimeVersion(IExecutionContext executionContext, string preferredVersion)
         {
-            return Task.FromResult<string>(preferredVersion);
+            bool deprecateArm32 = executionContext.Global.Variables?.GetBoolean(Constants.Runner.NodeMigration.DeprecateLinuxArm32Flag) ?? false;
+            bool killArm32 = executionContext.Global.Variables?.GetBoolean(Constants.Runner.NodeMigration.KillLinuxArm32Flag) ?? false;
+            string node20RemovalDate = executionContext.Global.Variables?.Get(Constants.Runner.NodeMigration.Node20RemovalDateVariable);
+
+            var (nodeVersion, warningMessage) = Common.Util.NodeUtil.CheckNodeVersionForLinuxArm32(preferredVersion, deprecateArm32, killArm32, node20RemovalDate);
+
+            if (nodeVersion == null)
+            {
+                executionContext.Error(warningMessage);
+                throw new InvalidOperationException(warningMessage);
+            }
+
+            if (!string.IsNullOrEmpty(warningMessage))
+            {
+                executionContext.Warning(warningMessage);
+            }
+
+            return Task.FromResult(nodeVersion);
         }
 
         public async Task<int> ExecuteAsync(IExecutionContext context,
@@ -137,8 +152,22 @@ namespace GitHub.Runner.Worker.Handlers
 
         public async Task<string> DetermineNodeRuntimeVersion(IExecutionContext executionContext, string preferredVersion)
         {
-            // Optimistically use the default
-            string nodeExternal = preferredVersion;
+            bool deprecateArm32 = executionContext.Global.Variables?.GetBoolean(Constants.Runner.NodeMigration.DeprecateLinuxArm32Flag) ?? false;
+            bool killArm32 = executionContext.Global.Variables?.GetBoolean(Constants.Runner.NodeMigration.KillLinuxArm32Flag) ?? false;
+            string node20RemovalDate = executionContext.Global.Variables?.Get(Constants.Runner.NodeMigration.Node20RemovalDateVariable);
+
+            var (nodeExternal, warningMessage) = Common.Util.NodeUtil.CheckNodeVersionForLinuxArm32(preferredVersion, deprecateArm32, killArm32, node20RemovalDate);
+
+            if (nodeExternal == null)
+            {
+                executionContext.Error(warningMessage);
+                throw new InvalidOperationException(warningMessage);
+            }
+
+            if (!string.IsNullOrEmpty(warningMessage))
+            {
+                executionContext.Warning(warningMessage);
+            }
 
             if (FeatureManager.IsContainerHooksEnabled(executionContext.Global.Variables))
             {
@@ -264,7 +293,24 @@ namespace GitHub.Runner.Worker.Handlers
 
         private string CheckPlatformForAlpineContainer(IExecutionContext executionContext, string preferredVersion)
         {
-            string nodeExternal = preferredVersion;
+            bool deprecateArm32 = executionContext.Global.Variables?.GetBoolean(Constants.Runner.NodeMigration.DeprecateLinuxArm32Flag) ?? false;
+            bool killArm32 = executionContext.Global.Variables?.GetBoolean(Constants.Runner.NodeMigration.KillLinuxArm32Flag) ?? false;
+            string node20RemovalDate = executionContext.Global.Variables?.Get(Constants.Runner.NodeMigration.Node20RemovalDateVariable);
+
+            var (nodeExternal, warningMessage) = Common.Util.NodeUtil.CheckNodeVersionForLinuxArm32(preferredVersion, deprecateArm32, killArm32, node20RemovalDate);
+
+            if (nodeExternal == null)
+            {
+                executionContext.Error(warningMessage);
+                throw new InvalidOperationException(warningMessage);
+            }
+
+            if (!string.IsNullOrEmpty(warningMessage))
+            {
+                executionContext.Warning(warningMessage);
+            }
+
+            // Check for Alpine container compatibility
             if (!Constants.Runner.PlatformArchitecture.Equals(Constants.Architecture.X64))
             {
                 var os = Constants.Runner.Platform.ToString();

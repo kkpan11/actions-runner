@@ -23,7 +23,7 @@ namespace GitHub.Runner.Listener
         private RunnerSettings _settings;
         private ITerminal _term;
         private TimeSpan _getNextMessageRetryInterval;
-        private TaskAgentStatus runnerStatus = TaskAgentStatus.Online;
+        private TaskAgentStatus _runnerStatus = TaskAgentStatus.Online;
         private CancellationTokenSource _getMessagesTokenSource;
         private VssCredentials _creds;
         private VssCredentials _credsV2;
@@ -167,12 +167,15 @@ namespace GitHub.Runner.Listener
                     Trace.Error("Catch exception during create session.");
                     Trace.Error(ex);
 
-                    // If using migrated settings, limit the number of retries before returning failure
-                    if (_isMigratedSettings)
+                    // When using migrated settings, cap retries for generic transient/retriable errors so we can
+                    // fall back to the original .runner settings instead of retrying the migrated settings forever.
+                    // Session conflict (4 min) has its own bounded retry limits and are
+                    // excluded here so they keep their v1-consistent behavior.
+                    if (_isMigratedSettings &&
+                        ex is not TaskAgentSessionConflictException)
                     {
                         _migratedSettingsRetryCount++;
                         Trace.Warning($"Migrated settings retry {_migratedSettingsRetryCount} of {_maxMigratedSettingsRetries}");
-                        
                         if (_migratedSettingsRetryCount >= _maxMigratedSettingsRetries)
                         {
                             Trace.Warning("Reached maximum retry attempts for migrated settings. Returning failure to try default settings.");
@@ -258,7 +261,7 @@ namespace GitHub.Runner.Listener
         public void OnJobStatus(object sender, JobStatusEventArgs e)
         {
             Trace.Info("Received job status event. JobState: {0}", e.Status);
-            runnerStatus = e.Status;
+            _runnerStatus = e.Status;
             try
             {
                 _getMessagesTokenSource?.Cancel();
@@ -291,7 +294,7 @@ namespace GitHub.Runner.Listener
                     }
 
                     message = await _brokerServer.GetRunnerMessageAsync(_session.SessionId,
-                                                                        runnerStatus,
+                                                                        _runnerStatus,
                                                                         BuildConstants.RunnerPackage.Version,
                                                                         VarUtil.OS,
                                                                         VarUtil.OSArchitecture,
@@ -338,7 +341,14 @@ namespace GitHub.Runner.Listener
                     Trace.Error("Catch exception during get next message.");
                     Trace.Error(ex);
 
+                    // don't retry if SkipSessionRecover = true, the service will delete the runner session to stop the runner from taking more jobs.
                     if (!HostContext.AllowAuthMigration &&
+                        ex is TaskAgentSessionExpiredException &&
+                        !_settings.SkipSessionRecover && (await CreateSessionAsync(token) == CreateSessionResult.Success))
+                    {
+                        Trace.Info($"{nameof(TaskAgentSessionExpiredException)} received, recovered by recreate session.");
+                    }
+                    else if (!HostContext.AllowAuthMigration &&
                         !IsGetNextMessageExceptionRetriable(ex))
                     {
                         throw new NonRetryableException("Get next message failed with non-retryable error.", ex);
@@ -415,6 +425,21 @@ namespace GitHub.Runner.Listener
         public async Task DeleteMessageAsync(TaskAgentMessage message)
         {
             await Task.CompletedTask;
+        }
+
+        public async Task AcknowledgeMessageAsync(string runnerRequestId, CancellationToken cancellationToken)
+        {
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)); // Short timeout
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+            Trace.Info($"Acknowledging runner request '{runnerRequestId}'.");
+            await _brokerServer.AcknowledgeRunnerRequestAsync(
+                runnerRequestId,
+                _session.SessionId,
+                _runnerStatus,
+                BuildConstants.RunnerPackage.Version,
+                VarUtil.OS,
+                VarUtil.OSArchitecture,
+                linkedCts.Token);
         }
 
         private bool IsGetNextMessageExceptionRetriable(Exception ex)

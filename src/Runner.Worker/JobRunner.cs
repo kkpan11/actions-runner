@@ -13,6 +13,7 @@ using GitHub.DistributedTask.WebApi;
 using GitHub.Runner.Common;
 using GitHub.Runner.Common.Util;
 using GitHub.Runner.Sdk;
+using GitHub.Runner.Worker.Dap;
 using GitHub.Services.Common;
 using GitHub.Services.WebApi;
 using Sdk.RSWebApi.Contracts;
@@ -50,8 +51,11 @@ namespace GitHub.Runner.Worker
             if (message.Variables.TryGetValue(Constants.Variables.System.OrchestrationId, out VariableValue orchestrationId) &&
                 !string.IsNullOrEmpty(orchestrationId.Value))
             {
-                // make the orchestration id the first item in the user-agent header to avoid get truncated in server log.
-                HostContext.UserAgents.Insert(0, new ProductInfoHeaderValue("OrchestrationId", orchestrationId.Value));
+                if (!HostContext.UserAgents.Any(x => string.Equals(x.Product?.Name, "OrchestrationId", StringComparison.OrdinalIgnoreCase)))
+                {
+                    // make the orchestration id the first item in the user-agent header to avoid get truncated in server log.
+                    HostContext.UserAgents.Insert(0, new ProductInfoHeaderValue("OrchestrationId", orchestrationId.Value));
+                }
 
                 // make sure orchestration id is in the user-agent header.
                 VssUtil.InitializeVssClientSettings(HostContext.UserAgents, HostContext.WebProxy);
@@ -175,6 +179,7 @@ namespace GitHub.Runner.Worker
                 _tempDirectoryManager = HostContext.GetService<ITempDirectoryManager>();
                 _tempDirectoryManager.InitializeTempDirectory(jobContext);
 
+
                 // Get the job extension.
                 Trace.Info("Getting job extension.");
                 IJobExtension jobExtension = HostContext.CreateService<IJobExtension>();
@@ -224,6 +229,12 @@ namespace GitHub.Runner.Worker
                     foreach (var step in jobSteps)
                     {
                         jobContext.JobSteps.Enqueue(step);
+                    }
+
+                    if (jobContext.Global.Debugger?.Enabled == true)
+                    {
+                        var dapDebugger = HostContext.GetService<IDapDebugger>();
+                        await dapDebugger.OnJobStepsInitializedAsync(jobContext.JobSteps, jobContext.PostJobSteps);
                     }
 
                     await stepsRunner.RunAsync(jobContext);
@@ -318,7 +329,7 @@ namespace GitHub.Runner.Worker
             {
                 try
                 {
-                    await runServer.CompleteJobAsync(message.Plan.PlanId, message.JobId, result, jobContext.JobOutputs, jobContext.Global.StepsResult, jobContext.Global.JobAnnotations, environmentUrl, telemetry, billingOwnerId: message.BillingOwnerId, default);
+                    await runServer.CompleteJobAsync(message.Plan.PlanId, message.JobId, result, jobContext.JobOutputs, jobContext.Global.StepsResult, jobContext.Global.JobAnnotations, environmentUrl, telemetry, billingOwnerId: message.BillingOwnerId, infrastructureFailureCategory: jobContext.Global.InfrastructureFailureCategory, default);
                     return result;
                 }
                 catch (VssUnauthorizedException ex)

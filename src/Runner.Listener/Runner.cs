@@ -5,8 +5,8 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
-using System.Security.Cryptography;
 using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -324,8 +324,11 @@ namespace GitHub.Runner.Listener
                         HostContext.EnableAuthMigration("EnableAuthMigrationByDefault");
                     }
 
+                    // hosted runner only run one job and would like to know the result of the job for telemetry and alerting on failure spike.
+                    var returnJobResultForHosted = StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable("ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED"));
+
                     // Run the runner interactively or as service
-                    return await ExecuteRunnerAsync(settings, command.RunOnce || settings.Ephemeral);
+                    return await ExecuteRunnerAsync(settings, command.RunOnce || settings.Ephemeral || returnJobResultForHosted, returnJobResultForHosted);
                 }
                 else
                 {
@@ -401,17 +404,32 @@ namespace GitHub.Runner.Listener
         }
 
         //create worker manager, create message listener and start listening to the queue
-        private async Task<int> RunAsync(RunnerSettings settings, bool runOnce = false)
+        private async Task<int> RunAsync(RunnerSettings settings, bool runOnce = false, bool returnRunOnceJobResult = false)
         {
             try
             {
                 Trace.Info(nameof(RunAsync));
-                
+
+                // Validate directory permissions.
+                string workDirectory = HostContext.GetDirectory(WellKnownDirectory.Work);
+                Trace.Info($"Validating directory permissions for: '{workDirectory}'");
+                try
+                {
+                    Directory.CreateDirectory(workDirectory);
+                    IOUtil.ValidateExecutePermission(workDirectory);
+                }
+                catch (Exception ex)
+                {
+                    Trace.Error(ex);
+                    _term.WriteError($"Fail to create and validate runner's work directory '{workDirectory}'.");
+                    return Constants.Runner.ReturnCode.TerminatedError;
+                }
+
                 // First try using migrated settings if available
                 var configManager = HostContext.GetService<IConfigurationManager>();
                 RunnerSettings migratedSettings = null;
-                
-                try 
+
+                try
                 {
                     migratedSettings = configManager.LoadMigratedSettings();
                     Trace.Info("Loaded migrated settings from .runner_migrated file");
@@ -422,15 +440,15 @@ namespace GitHub.Runner.Listener
                     // If migrated settings file doesn't exist or can't be loaded, we'll use the provided settings
                     Trace.Info($"Failed to load migrated settings: {ex.Message}");
                 }
-                
+
                 bool usedMigratedSettings = false;
-                
+
                 if (migratedSettings != null)
                 {
                     // Try to create session with migrated settings first
                     Trace.Info("Attempting to create session using migrated settings");
                     _listener = GetMessageListener(migratedSettings, isMigratedSettings: true);
-                    
+
                     try
                     {
                         CreateSessionResult createSessionResult = await _listener.CreateSessionAsync(HostContext.RunnerShutdownToken);
@@ -450,7 +468,7 @@ namespace GitHub.Runner.Listener
                         Trace.Error($"Exception when creating session with migrated settings: {ex}");
                     }
                 }
-                
+
                 // If migrated settings weren't used or session creation failed, use original settings
                 if (!usedMigratedSettings)
                 {
@@ -480,6 +498,7 @@ namespace GitHub.Runner.Listener
                 bool skipSessionDeletion = false;
                 bool restartSession = false; // Flag to indicate session restart
                 bool restartSessionPending = false;
+                bool cleanupLocalConfigAfter404 = false;
                 try
                 {
                     var notification = HostContext.GetService<IJobNotification>();
@@ -503,7 +522,7 @@ namespace GitHub.Runner.Listener
                             restartSession = true;
                             break;
                         }
-                        
+
                         TaskAgentMessage message = null;
                         bool skipMessageDeletion = false;
                         try
@@ -563,6 +582,21 @@ namespace GitHub.Runner.Listener
                                     catch (Exception ex)
                                     {
                                         Trace.Info($"Ignore any exception after cancel message loop. {ex}");
+                                    }
+
+                                    if (returnRunOnceJobResult)
+                                    {
+                                        try
+                                        {
+                                            var jobResult = await jobDispatcher.RunOnceJobCompleted.Task;
+                                            return TaskResultUtil.TranslateToReturnCode(jobResult);
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Trace.Error("run once job finished with error.");
+                                            Trace.Error(ex);
+                                            return Constants.Runner.ReturnCode.TerminatedError;
+                                        }
                                     }
 
                                     return Constants.Runner.ReturnCode.Success;
@@ -654,22 +688,48 @@ namespace GitHub.Runner.Listener
                                 else
                                 {
                                     var messageRef = StringUtil.ConvertFromJson<RunnerJobRequestRef>(message.Body);
-                                    Pipelines.AgentJobRequestMessage jobRequestMessage = null;
+                                    
+                                    // Acknowledge (best-effort)
+                                    if (messageRef.ShouldAcknowledge) // Temporary feature flag
+                                    {
+                                        try
+                                        {
+                                            await _listener.AcknowledgeMessageAsync(messageRef.RunnerRequestId, messageQueueLoopTokenSource.Token);
+                                        }
+                                        catch (RunnerRequestJobNotFoundException) when (settings.Ephemeral)
+                                        {
+                                            Trace.Info($"Acknowledge returned job-not-found for ephemeral runner request '{messageRef.RunnerRequestId}'. Exiting runner.");
+                                            runOnceJobCompleted = true;
+                                            return Constants.Runner.ReturnCode.Success;
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Trace.Error($"Best-effort acknowledge failed for request '{messageRef.RunnerRequestId}'");
+                                            Trace.Error(ex);
+                                        }
+                                    }
 
-                                    // Create connection
-                                    var credMgr = HostContext.GetService<ICredentialManager>();
+                                    Pipelines.AgentJobRequestMessage jobRequestMessage = null;
                                     if (string.IsNullOrEmpty(messageRef.RunServiceUrl))
                                     {
+                                        // Connect
+                                        var credMgr = HostContext.GetService<ICredentialManager>();
                                         var creds = credMgr.LoadCredentials(allowAuthUrlV2: false);
                                         var actionsRunServer = HostContext.CreateService<IActionsRunServer>();
                                         await actionsRunServer.ConnectAsync(new Uri(settings.ServerUrl), creds);
+
+                                        // Get job message
                                         jobRequestMessage = await actionsRunServer.GetJobMessageAsync(messageRef.RunnerRequestId, messageQueueLoopTokenSource.Token);
                                     }
                                     else
                                     {
+                                        // Connect
+                                        var credMgr = HostContext.GetService<ICredentialManager>();
                                         var credsV2 = credMgr.LoadCredentials(allowAuthUrlV2: true);
                                         var runServer = HostContext.CreateService<IRunServer>();
                                         await runServer.ConnectAsync(new Uri(messageRef.RunServiceUrl), credsV2);
+
+                                        // Get job message
                                         try
                                         {
                                             jobRequestMessage = await runServer.GetJobMessageAsync(messageRef.RunnerRequestId, messageRef.BillingOwnerId, messageQueueLoopTokenSource.Token);
@@ -698,7 +758,10 @@ namespace GitHub.Runner.Listener
                                         }
                                     }
 
+                                    // Dispatch
                                     jobDispatcher.Run(jobRequestMessage, runOnce);
+
+                                    // Run once?
                                     if (runOnce)
                                     {
                                         Trace.Info("One time used runner received job message.");
@@ -757,6 +820,14 @@ namespace GitHub.Runner.Listener
                                 Trace.Error($"Received message {message.MessageId} with unsupported message type {message.MessageType}.");
                             }
                         }
+                        catch (Exception ex) when (ex is TaskAgentNotFoundException || ex is RunnerNotFoundException)
+                        {
+                            Trace.Info($"Runner registration no longer exists while retrieving messages. {ex.Message}");
+                            _term.WriteError("The runner no longer exists on the server. Cleaning up local configuration.");
+                            skipSessionDeletion = true;
+                            cleanupLocalConfigAfter404 = true;
+                            break;
+                        }
                         finally
                         {
                             if (!skipMessageDeletion && message != null)
@@ -803,7 +874,7 @@ namespace GitHub.Runner.Listener
 
                     messageQueueLoopTokenSource.Dispose();
 
-                    if (settings.Ephemeral && runOnceJobCompleted)
+                    if ((settings.Ephemeral && runOnceJobCompleted) || cleanupLocalConfigAfter404)
                     {
                         configManager.DeleteLocalRunnerConfig();
                     }
@@ -828,15 +899,15 @@ namespace GitHub.Runner.Listener
             return Constants.Runner.ReturnCode.Success;
         }
 
-        private async Task<int> ExecuteRunnerAsync(RunnerSettings settings, bool runOnce)
+        private async Task<int> ExecuteRunnerAsync(RunnerSettings settings, bool runOnce, bool returnRunOnceJobResult)
         {
             int returnCode = Constants.Runner.ReturnCode.Success;
             bool restart = false;
             do
             {
                 restart = false;
-                returnCode = await RunAsync(settings, runOnce);
-                
+                returnCode = await RunAsync(settings, runOnce, returnRunOnceJobResult);
+
                 if (returnCode == Constants.Runner.ReturnCode.RunnerConfigurationRefreshed)
                 {
                     Trace.Info("Runner configuration was refreshed, restarting session...");

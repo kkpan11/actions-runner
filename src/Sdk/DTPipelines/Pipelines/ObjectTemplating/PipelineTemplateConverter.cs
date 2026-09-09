@@ -55,7 +55,18 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
                         break;
                     case ActionSourceType.Repository:
                         var repositoryReference = step.Reference as RepositoryPathReference;
-                        name = !String.IsNullOrEmpty(repositoryReference.Name) ? repositoryReference.Name : PipelineConstants.SelfAlias;
+                        if (!String.IsNullOrEmpty(repositoryReference.Name))
+                        {
+                            name = repositoryReference.Name;
+                        }
+                        else if (String.Equals(repositoryReference.RepositoryType, PipelineConstants.SelfRepositoryAlias, StringComparison.OrdinalIgnoreCase))
+                        {
+                            name = PipelineConstants.SelfRepositoryAlias;
+                        }
+                        else
+                        {
+                            name = PipelineConstants.SelfAlias;
+                        }
                         break;
                 }
 
@@ -237,7 +248,8 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         internal static JobContainer ConvertToJobContainer(
             TemplateContext context,
             TemplateToken value,
-            bool allowExpressions = false)
+            bool allowExpressions = false,
+            bool allowServiceContainerCommand = false)
         {
             var result = new JobContainer();
             if (allowExpressions && value.Traverse().Any(x => x is ExpressionToken))
@@ -279,6 +291,22 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
                             break;
                         case PipelineTemplateConstants.Options:
                             result.Options = containerPropertyPair.Value.AssertString($"{PipelineTemplateConstants.Container} {propertyName}").Value;
+                            break;
+                        case PipelineTemplateConstants.Entrypoint:
+                            if (!allowServiceContainerCommand)
+                            {
+                                context.Error(containerPropertyPair.Key, $"The key '{PipelineTemplateConstants.Entrypoint}' is not allowed");
+                                break;
+                            }
+                            result.Entrypoint = containerPropertyPair.Value.AssertString($"{PipelineTemplateConstants.Container} {propertyName}").Value;
+                            break;
+                        case PipelineTemplateConstants.Command:
+                            if (!allowServiceContainerCommand)
+                            {
+                                context.Error(containerPropertyPair.Key, $"The key '{PipelineTemplateConstants.Command}' is not allowed");
+                                break;
+                            }
+                            result.Command = containerPropertyPair.Value.AssertString($"{PipelineTemplateConstants.Container} {propertyName}").Value;
                             break;
                         case PipelineTemplateConstants.Ports:
                             var ports = containerPropertyPair.Value.AssertSequence($"{PipelineTemplateConstants.Container} {propertyName}");
@@ -326,7 +354,8 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         internal static List<KeyValuePair<String, JobContainer>> ConvertToJobServiceContainers(
             TemplateContext context,
             TemplateToken services,
-            bool allowExpressions = false)
+            bool allowExpressions = false,
+            bool allowServiceContainerCommand = false)
         {
             var result = new List<KeyValuePair<String, JobContainer>>();
 
@@ -340,7 +369,7 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
             foreach (var servicePair in servicesMapping)
             {
                 var networkAlias = servicePair.Key.AssertString("services key").Value;
-                var container = ConvertToJobContainer(context, servicePair.Value);
+                var container = ConvertToJobContainer(context, servicePair.Value, allowExpressions, allowServiceContainerCommand);
                 result.Add(new KeyValuePair<String, JobContainer>(networkAlias, container));
             }
 
@@ -580,6 +609,14 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
                     {
                         RepositoryType = PipelineConstants.SelfAlias,
                         Path = uses.Value
+                    };
+                }
+                else if (PipelineConstants.TryParseSelfRepository(uses.Value, out var selfPath))
+                {
+                    result.Reference = new RepositoryPathReference
+                    {
+                        RepositoryType = PipelineConstants.SelfRepositoryAlias,
+                        Path = selfPath
                     };
                 }
                 else

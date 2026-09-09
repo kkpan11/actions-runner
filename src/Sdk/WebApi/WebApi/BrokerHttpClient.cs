@@ -79,6 +79,7 @@ namespace GitHub.Actions.RunService.WebApi
             {
                 queryParams.Add("status", status.Value.ToString());
             }
+
             if (runnerVersion != null)
             {
                 queryParams.Add("runnerVersion", runnerVersion);
@@ -124,25 +125,17 @@ namespace GitHub.Actions.RunService.WebApi
                         };
                     case BrokerErrorKind.HostedRunnerDeprovisioned:
                         throw new HostedRunnerDeprovisionedException(brokerError.Message);
+                    case BrokerErrorKind.RunnerSessionInvalid:
+                        throw new TaskAgentSessionExpiredException(brokerError.Message);
                     default:
                         break;
                 }
-            }
-
-            // temporary back compat
-            if (result.StatusCode == HttpStatusCode.Forbidden)
-            {
-                throw new AccessDeniedException($"{result.Error} Runner version v{runnerVersion} is deprecated and cannot receive messages.")
-                {
-                    ErrorCode = 1
-                };
             }
 
             throw new Exception($"Failed to get job message. Request to {requestUri} failed with status: {result.StatusCode}. Error message {result.Error}");
         }
 
         public async Task<TaskAgentSession> CreateSessionAsync(
-
            TaskAgentSession session,
            CancellationToken cancellationToken = default)
         {
@@ -189,6 +182,76 @@ namespace GitHub.Actions.RunService.WebApi
             }
 
             throw new Exception($"Failed to delete broker session: {result.Error}");
+        }
+
+        public async Task AcknowledgeRunnerRequestAsync(
+            string runnerRequestId,
+            Guid? sessionId,
+            string runnerVersion,
+            TaskAgentStatus? status,
+            string os = null,
+            string architecture = null,
+            CancellationToken cancellationToken = default)
+        {
+            // URL
+            var requestUri = new Uri(Client.BaseAddress, "acknowledge");
+
+            // Query parameters
+            List<KeyValuePair<string, string>> queryParams = new List<KeyValuePair<string, string>>();
+            if (sessionId != null)
+            {
+                queryParams.Add("sessionId", sessionId.Value.ToString());
+            }
+            if (status != null)
+            {
+                queryParams.Add("status", status.Value.ToString());
+            }
+            if (runnerVersion != null)
+            {
+                queryParams.Add("runnerVersion", runnerVersion);
+            }
+            if (os != null)
+            {
+                queryParams.Add("os", os);
+            }
+            if (architecture != null)
+            {
+                queryParams.Add("architecture", architecture);
+            }
+
+            // Body
+            var payload = new Dictionary<string, string>
+            {
+                ["runnerRequestId"] = runnerRequestId,
+            };
+            var requestContent = new ObjectContent<Dictionary<string, string>>(payload, new VssJsonMediaTypeFormatter(true));
+
+            // POST
+            var result = await SendAsync<object>(
+                new HttpMethod("POST"),
+                requestUri: requestUri,
+                queryParameters: queryParams,
+                content: requestContent,
+                readErrorBody: true,
+                cancellationToken: cancellationToken);
+
+            if (result.IsSuccess)
+            {
+                return;
+            }
+
+            if (TryParseErrorBody(result.ErrorBody, out BrokerError brokerError))
+            {
+                switch (brokerError.ErrorKind)
+                {
+                    case BrokerErrorKind.AcknowledgeJobNotFound:
+                        throw new RunnerRequestJobNotFoundException(brokerError.Message);
+                    case BrokerErrorKind.RunnerNotFound:
+                        throw new RunnerNotFoundException(brokerError.Message);
+                }
+            }
+
+            throw new Exception($"Failed to acknowledge runner request. Request to {requestUri} failed with status: {result.StatusCode}. Error message {result.Error}");
         }
 
         private static bool TryParseErrorBody(string errorBody, out BrokerError error)

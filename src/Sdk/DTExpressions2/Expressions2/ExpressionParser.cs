@@ -349,6 +349,10 @@ namespace GitHub.DistributedTask.Expressions2
             {
                 throw new ParseException(ParseExceptionKind.TooManyParameters, token: @operator, expression: context.Expression);
             }
+            else if (functionInfo.Name.Equals("case", StringComparison.OrdinalIgnoreCase) && function.Parameters.Count % 2 == 0)
+            {
+                throw new ParseException(ParseExceptionKind.EvenParameters, token: @operator, expression: context.Expression);
+            }
         }
 
         /// <summary>

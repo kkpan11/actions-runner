@@ -24,7 +24,7 @@ namespace GitHub.Runner.Listener
     public interface IJobDispatcher : IRunnerService
     {
         bool Busy { get; }
-        TaskCompletionSource<bool> RunOnceJobCompleted { get; }
+        TaskCompletionSource<TaskResult> RunOnceJobCompleted { get; }
         void Run(Pipelines.AgentJobRequestMessage message, bool runOnce = false);
         bool Cancel(JobCancelMessage message);
         Task WaitAsync(CancellationToken token);
@@ -56,7 +56,7 @@ namespace GitHub.Runner.Listener
         // timeout limit can be overwritten by environment GITHUB_ACTIONS_RUNNER_CHANNEL_TIMEOUT
         private TimeSpan _channelTimeout;
 
-        private TaskCompletionSource<bool> _runOnceJobCompleted = new();
+        private TaskCompletionSource<TaskResult> _runOnceJobCompleted = new();
 
         public event EventHandler<JobStatusEventArgs> JobStatus;
 
@@ -82,7 +82,7 @@ namespace GitHub.Runner.Listener
             Trace.Info($"Set runner/worker IPC timeout to {_channelTimeout.TotalSeconds} seconds.");
         }
 
-        public TaskCompletionSource<bool> RunOnceJobCompleted => _runOnceJobCompleted;
+        public TaskCompletionSource<TaskResult> RunOnceJobCompleted => _runOnceJobCompleted;
 
         public bool Busy { get; private set; }
 
@@ -110,7 +110,12 @@ namespace GitHub.Runner.Listener
             {
                 var jwt = JsonWebToken.Create(accessToken);
                 var claims = jwt.ExtractClaims();
-                orchestrationId = claims.FirstOrDefault(x => string.Equals(x.Type, "orchid", StringComparison.OrdinalIgnoreCase))?.Value;
+                orchestrationId = claims.FirstOrDefault(x => string.Equals(x.Type, "orch_id", StringComparison.OrdinalIgnoreCase))?.Value;
+                if (string.IsNullOrEmpty(orchestrationId))
+                {
+                    orchestrationId = claims.FirstOrDefault(x => string.Equals(x.Type, "orchid", StringComparison.OrdinalIgnoreCase))?.Value;
+                }
+
                 if (!string.IsNullOrEmpty(orchestrationId))
                 {
                     Trace.Info($"Pull OrchestrationId {orchestrationId} from JWT claims");
@@ -249,6 +254,8 @@ namespace GitHub.Runner.Listener
                 {
                     Trace.Error($"We are not yet checking the state of jobrequest {jobDispatch.JobId} status. Cancel running worker right away.");
                     jobDispatch.WorkerCancellationTokenSource.Cancel();
+                    // wait for worker process exit then return.
+                    await jobDispatch.WorkerDispatch;
                     return;
                 }
 
@@ -335,18 +342,19 @@ namespace GitHub.Runner.Listener
 
         private async Task RunOnceAsync(Pipelines.AgentJobRequestMessage message, string orchestrationId, WorkerDispatcher previousJobDispatch, CancellationToken jobRequestCancellationToken, CancellationToken workerCancelTimeoutKillToken)
         {
+            var jobResult = TaskResult.Succeeded;
             try
             {
-                await RunAsync(message, orchestrationId, previousJobDispatch, jobRequestCancellationToken, workerCancelTimeoutKillToken);
+                jobResult = await RunAsync(message, orchestrationId, previousJobDispatch, jobRequestCancellationToken, workerCancelTimeoutKillToken);
             }
             finally
             {
                 Trace.Info("Fire signal for one time used runner.");
-                _runOnceJobCompleted.TrySetResult(true);
+                _runOnceJobCompleted.TrySetResult(jobResult);
             }
         }
 
-        private async Task RunAsync(Pipelines.AgentJobRequestMessage message, string orchestrationId, WorkerDispatcher previousJobDispatch, CancellationToken jobRequestCancellationToken, CancellationToken workerCancelTimeoutKillToken)
+        private async Task<TaskResult> RunAsync(Pipelines.AgentJobRequestMessage message, string orchestrationId, WorkerDispatcher previousJobDispatch, CancellationToken jobRequestCancellationToken, CancellationToken workerCancelTimeoutKillToken)
         {
             Busy = true;
             try
@@ -394,7 +402,7 @@ namespace GitHub.Runner.Listener
                     {
                         // renew job request task complete means we run out of retry for the first job request renew.
                         Trace.Info($"Unable to renew job request for job {message.JobId} for the first time, stop dispatching job to worker.");
-                        return;
+                        return TaskResult.Abandoned;
                     }
 
                     if (jobRequestCancellationToken.IsCancellationRequested)
@@ -407,7 +415,7 @@ namespace GitHub.Runner.Listener
 
                         // complete job request with result Cancelled
                         await CompleteJobRequestAsync(_poolId, message, systemConnection, lockToken, TaskResult.Canceled);
-                        return;
+                        return TaskResult.Canceled;
                     }
 
                     HostContext.WritePerfCounter($"JobRequestRenewed_{requestId.ToString()}");
@@ -518,7 +526,7 @@ namespace GitHub.Runner.Listener
                             await renewJobRequest;
 
                             // not finish the job request since the job haven't run on worker at all, we will not going to set a result to server.
-                            return;
+                            return TaskResult.Failed;
                         }
 
                         // we get first jobrequest renew succeed and start the worker process with the job message.
@@ -599,7 +607,7 @@ namespace GitHub.Runner.Listener
                                     Trace.Error(detailInfo);
                                 }
 
-                                return;
+                                return TaskResultUtil.TranslateFromReturnCode(returnCode);
                             }
                             else if (completedTask == renewJobRequest)
                             {
@@ -701,6 +709,8 @@ namespace GitHub.Runner.Listener
 
                             // complete job request
                             await CompleteJobRequestAsync(_poolId, message, systemConnection, lockToken, resultOnAbandonOrCancel);
+
+                            return resultOnAbandonOrCancel;
                         }
                         finally
                         {
@@ -1206,7 +1216,7 @@ namespace GitHub.Runner.Listener
                     jobAnnotations.Add(annotation.Value);
                 }
 
-                await runServer.CompleteJobAsync(message.Plan.PlanId, message.JobId, TaskResult.Failed, outputs: null, stepResults: null, jobAnnotations: jobAnnotations, environmentUrl: null, telemetry: null, billingOwnerId: message.BillingOwnerId, CancellationToken.None);
+                await runServer.CompleteJobAsync(message.Plan.PlanId, message.JobId, TaskResult.Failed, outputs: null, stepResults: null, jobAnnotations: jobAnnotations, environmentUrl: null, telemetry: null, billingOwnerId: message.BillingOwnerId, infrastructureFailureCategory: null, CancellationToken.None);
             }
             catch (Exception ex)
             {

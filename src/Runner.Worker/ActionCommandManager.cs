@@ -282,8 +282,15 @@ namespace GitHub.Runner.Worker
                 }
             }
 
-            context.Global.EnvironmentVariables[envName] = command.Data;
-            context.SetEnvContext(envName, command.Data);
+            if (context.DeferredEnvironmentVariables != null)
+            {
+                context.DeferredEnvironmentVariables[envName] = command.Data;
+            }
+            else
+            {
+                context.Global.EnvironmentVariables[envName] = command.Data;
+                context.SetEnvContext(envName, command.Data);
+            }
             context.Debug($"{envName}='{command.Data}'");
         }
 
@@ -318,13 +325,31 @@ namespace GitHub.Runner.Worker
                 context.AddIssue(issue, ExecutionContextLogOptions.Default);
             }
 
+            if (!context.Global.HasDeprecatedSetOutput)
+            {
+                context.Global.HasDeprecatedSetOutput = true;
+                var telemetry = new JobTelemetry
+                {
+                    Type = JobTelemetryType.ActionCommand,
+                    Message = "DeprecatedCommand: set-output"
+                };
+                context.Global.JobTelemetry.Add(telemetry);
+            }
+
             if (!command.Properties.TryGetValue(SetOutputCommandProperties.Name, out string outputName) || string.IsNullOrEmpty(outputName))
             {
                 throw new Exception("Required field 'name' is missing in ##[set-output] command.");
             }
 
-            context.SetOutput(outputName, command.Data, out var reference);
-            context.Debug($"{reference}='{command.Data}'");
+            if (context.DeferredOutputs != null)
+            {
+                context.DeferredOutputs[outputName] = command.Data;
+            }
+            else
+            {
+                context.SetOutput(outputName, command.Data, out var reference);
+                context.Debug($"{reference}='{command.Data}'");
+            }
         }
 
         private static class SetOutputCommandProperties
@@ -351,6 +376,17 @@ namespace GitHub.Runner.Worker
                 };
                 issue.Data[Constants.Runner.InternalTelemetryIssueDataKey] = Constants.Runner.UnsupportedCommand;
                 context.AddIssue(issue, ExecutionContextLogOptions.Default);
+            }
+
+            if (!context.Global.HasDeprecatedSaveState)
+            {
+                context.Global.HasDeprecatedSaveState = true;
+                var telemetry = new JobTelemetry
+                {
+                    Type = JobTelemetryType.ActionCommand,
+                    Message = "DeprecatedCommand: save-state"
+                };
+                context.Global.JobTelemetry.Add(telemetry);
             }
 
             if (!command.Properties.TryGetValue(SaveStateCommandProperties.Name, out string stateName) || string.IsNullOrEmpty(stateName))
@@ -443,8 +479,16 @@ namespace GitHub.Runner.Worker
             }
 
             ArgUtil.NotNullOrEmpty(command.Data, "path");
-            context.Global.PrependPath.RemoveAll(x => string.Equals(x, command.Data, StringComparison.CurrentCulture));
-            context.Global.PrependPath.Add(command.Data);
+            if (context.DeferredPrependPath != null)
+            {
+                context.DeferredPrependPath.RemoveAll(x => string.Equals(x, command.Data, StringComparison.CurrentCulture));
+                context.DeferredPrependPath.Add(command.Data);
+            }
+            else
+            {
+                context.Global.PrependPath.RemoveAll(x => string.Equals(x, command.Data, StringComparison.CurrentCulture));
+                context.Global.PrependPath.Add(command.Data);
+            }
         }
     }
 
